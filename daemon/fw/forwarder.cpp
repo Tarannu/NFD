@@ -28,7 +28,9 @@
 #include "core/random.hpp"
 #include "strategy.hpp"
 #include "face/null-face.hpp"
-
+#include <vector>
+#include <cmath>
+#include "rebroadcast.hpp"
 #include "utils/ndn-ns3-packet-tag.hpp"
 
 #include <boost/random/uniform_int_distribution.hpp>
@@ -160,6 +162,45 @@ Forwarder::onContentStoreHit(const Face& inFace,
   // goto outgoing Data pipeline
   this->onOutgoingData(data, *const_pointer_cast<Face>(inFace.shared_from_this()));
 }
+Forwarder::CalculateAngleandProjection(lp::GeoTag previousHop,lp::GeoTag previousTOpreviousHop, Ptr<ns3::Packet> Packet);
+
+{
+
+Vector3D lastHopPosition = Vector3D(previousHop.getPosX(), previousHop.getPosY(), 0)
+Vector3D previousTOpreviousHop = ; //* have to add pointer to pit table entry hence interest.cpp needs changes to get the tag from the matching interest in pitentry 
+
+//to previous hop or the producer of interest
+
+Vector3D currentPosition = mobility->GetPosition(); 
+
+// Distance calculation using Getlength() function from mobility.h 
+
+Distance(currentPosition,lastHopPosition) = CalculateDistance(currentPosition,lastHopPosition) ;
+Distance(currentPosition,previousTOpreviousHop) = CalculateDistance(currentPosition,previousTOpreviousHop);
+Distance(lastHopPosition,previousTOpreviousHop) = CalculateDistance(lastHopPosition,previousTOpreviousHop);
+// Angle made at producer or previousTOpreviousHop by currentposition and lastposition
+
+Angle_rad = acos((Distance(currentPosition,lastHopPosition)^2 + Distance(lastHopPosition,previousTOpreviousHop)^2 - Distance(currentPosition,previousTOpreviousHop) ))/(2*Distance(currentPosition,previousTOpreviousHop)*Distance(lastHopPosition,previousTOpreviousHop));
+Angle_Deg = Angle_rad * 180 / 3.141592 ;
+
+// Projection Calculation
+
+cosine_Angle_at_currentposition = ((Distance(currentPosition,lastHopPosition)^2 + Distance(lastHopPosition,previousTOpreviousHop)^2 - Distance(currentPosition,previousTOpreviousHop) ))/(2*Distance(currentPosition,previousTOpreviousHop)*Distance(lastHopPosition,previousTOpreviousHop));
+projection = Distance(currentPosition,lastHopPosition) * cosine_Angle_at_currentposition;
+// if angles between previous to previous hop and current node > 90'
+
+if (Angle_Deg > 90)
+{
+bool direction = true;
+}
+
+// also projection > Distance(Mypos,PPHpos)
+else if(projection > Distance(lastHopPosition,previousTOpreviousHop))
+{
+bool direction = true;
+}
+else {bool direction = false;}
+}
 
 void
 Forwarder::onInterestLoop(Face& inFace, const Interest& interest,
@@ -167,6 +208,24 @@ Forwarder::onInterestLoop(Face& inFace, const Interest& interest,
 {
   NFD_LOG_DEBUG("onInterestLoop face=" << inFace.getId() <<
                 " interest=" << interest.getName());
+                {
+
+
+
+NFD_LOG_DEBUG("onInterestLoop in=" << ingress << " interest=" << interest.getName()
+
+<< " CalculateAngle and Projection");
+
+if (direction){
+
+NFD_LOG_DEBUG("onInterestLoop in=" << ingress << " interest=" << interest.getName()
+
+<< " is sending for afterinterloop");
+
+this-> REBROADCASTING::afterreceiveinterest(interest);
+
+}
+
 
   // (drop)
 }
