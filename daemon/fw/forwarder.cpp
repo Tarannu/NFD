@@ -1,6 +1,6 @@
 /* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-/**
- * Copyright (c) 2014-2015,  Regents of the University of California,
+/*
+ * Copyright (c) 2014-2019,  Regents of the University of California,
  *                           Arizona Board of Regents,
  *                           Colorado State University,
  *                           University Pierre & Marie Curie, Sorbonne University,
@@ -24,41 +24,65 @@
  */
 
 #include "forwarder.hpp"
-#include "core/logger.hpp"
-#include "core/random.hpp"
+
+#include "algorithm.hpp"
+#include "best-route-strategy2.hpp"
 #include "strategy.hpp"
-#include "face/null-face.hpp"
+#include "core/logger.hpp"
+#include "table/cleanup.hpp"
 #include <vector>
 #include <cmath>
-#include "rebroadcast.hpp"
-#include "utils/ndn-ns3-packet-tag.hpp"
-
-#include <boost/random/uniform_int_distribution.hpp>
+#include <ndn-cxx/lp/tags.hpp>
+#include "ns3/mobility-module.h"
+#include "face/null-face.hpp"
 
 namespace nfd {
 
-NFD_LOG_INIT("Forwarder");
+NFD_LOG_INIT(Forwarder);
 
-using fw::Strategy;
-
-const Name Forwarder::LOCALHOST_NAME("ndn:/localhost");
+static Name
+getDefaultStrategyName()
+{
+  return fw::BestRouteStrategy2::getStrategyName();
+}
 
 Forwarder::Forwarder()
-  : m_faceTable(*this)
+  : m_unsolicitedDataPolicy(new fw::DefaultUnsolicitedDataPolicy())
   , m_fib(m_nameTree)
   , m_pit(m_nameTree)
   , m_measurements(m_nameTree)
-  , m_strategyChoice(m_nameTree, fw::makeDefaultStrategy(*this))
-  , m_csFace(make_shared<NullFace>(FaceUri("contentstore://")))
+  , m_strategyChoice(*this)
+  , m_csFace(face::makeNullFace(FaceUri("contentstore://")))
 {
-  fw::installStrategies(*this);
-  getFaceTable().addReserved(m_csFace, FACEID_CONTENT_STORE);
+  getFaceTable().addReserved(m_csFace, face::FACEID_CONTENT_STORE);
+
+  m_faceTable.afterAdd.connect([this] (Face& face) {
+    face.afterReceiveInterest.connect(
+      [this, &face] (const Interest& interest) {
+        this->startProcessInterest(face, interest);
+      });
+    face.afterReceiveData.connect(
+      [this, &face] (const Data& data) {
+        this->startProcessData(face, data);
+      });
+    face.afterReceiveNack.connect(
+      [this, &face] (const lp::Nack& nack) {
+        this->startProcessNack(face, nack);
+      });
+    face.onDroppedInterest.connect(
+      [this, &face] (const Interest& interest) {
+        this->onDroppedInterest(face, interest);
+      });
+  });
+
+  m_faceTable.beforeRemove.connect([this] (Face& face) {
+    cleanupOnFaceRemoval(m_nameTree, m_fib, m_pit, face);
+  });
+
+  m_strategyChoice.setDefaultStrategy(getDefaultStrategyName());
 }
 
-Forwarder::~Forwarder()
-{
-
-}
+Forwarder::~Forwarder() = default;
 
 void
 Forwarder::onIncomingInterest(Face& inFace, const Interest& interest)
@@ -66,12 +90,12 @@ Forwarder::onIncomingInterest(Face& inFace, const Interest& interest)
   // receive Interest
   NFD_LOG_DEBUG("onIncomingInterest face=" << inFace.getId() <<
                 " interest=" << interest.getName());
-  const_cast<Interest&>(interest).setIncomingFaceId(inFace.getId());
-  ++m_counters.getNInInterests();
+  interest.setTag(make_shared<lp::IncomingFaceIdTag>(inFace.getId()));
+  ++m_counters.nInInterests;
 
   // /localhost scope control
-  bool isViolatingLocalhost = !inFace.isLocal() &&
-                              LOCALHOST_NAME.isPrefixOf(interest.getName());
+  bool isViolatingLocalhost = inFace.getScope() == ndn::nfd::FACE_SCOPE_NON_LOCAL &&
+                              scope_prefix::LOCALHOST.isPrefixOf(interest.getName());
   if (isViolatingLocalhost) {
     NFD_LOG_DEBUG("onIncomingInterest face=" << inFace.getId() <<
                   " interest=" << interest.getName() << " violates /localhost");
@@ -79,30 +103,44 @@ Forwarder::onIncomingInterest(Face& inFace, const Interest& interest)
     return;
   }
 
-  // PIT insert
-  shared_ptr<pit::Entry> pitEntry = m_pit.insert(interest).first;
-
-  // detect duplicate Nonce
-  int dnw = pitEntry->findNonce(interest.getNonce(), inFace);
-  bool hasDuplicateNonce = (dnw != pit::DUPLICATE_NONCE_NONE) ||
-                           m_deadNonceList.has(interest.getName(), interest.getNonce());
-  if (hasDuplicateNonce) {
+  // detect duplicate Nonce with Dead Nonce List
+  bool hasDuplicateNonceInDnl = m_deadNonceList.has(interest.getName(), interest.getNonce());
+  if (hasDuplicateNonceInDnl) {
     // goto Interest loop pipeline
-    this->onInterestLoop(inFace, interest, pitEntry);
+    this->onInterestLoop(inFace, interest);
     return;
   }
 
-  // cancel unsatisfy & straggler timer
-  this->cancelUnsatisfyAndStragglerTimer(pitEntry);
+  // strip forwarding hint if Interest has reached producer region
+  if (!interest.getForwardingHint().empty() &&
+      m_networkRegionTable.isInProducerRegion(interest.getForwardingHint())) {
+    NFD_LOG_DEBUG("onIncomingInterest face=" << inFace.getId() <<
+                  " interest=" << interest.getName() << " reaching-producer-region");
+    const_cast<Interest&>(interest).setForwardingHint({});
+  }
+
+  // PIT insert
+  shared_ptr<pit::Entry> pitEntry = m_pit.insert(interest).first;
+
+  // detect duplicate Nonce in PIT entry
+  int dnw = fw::findDuplicateNonce(*pitEntry, interest.getNonce(), inFace);
+  bool hasDuplicateNonceInPit = dnw != fw::DUPLICATE_NONCE_NONE;
+  if (inFace.getLinkType() == ndn::nfd::LINK_TYPE_POINT_TO_POINT) {
+    // for p2p face: duplicate Nonce from same incoming face is not loop
+    hasDuplicateNonceInPit = hasDuplicateNonceInPit && !(dnw & fw::DUPLICATE_NONCE_IN_SAME);
+  }
+  if (hasDuplicateNonceInPit) {
+    // goto Interest loop pipeline
+    this->onInterestLoop(inFace, interest);
+    return;
+  }
 
   // is pending?
-  const pit::InRecordCollection& inRecords = pitEntry->getInRecords();
-  bool isPending = inRecords.begin() != inRecords.end();
-  if (!isPending) {
+  if (!pitEntry->hasInRecords()) {
     if (m_csFromNdnSim == nullptr) {
       m_cs.find(interest,
-                bind(&Forwarder::onContentStoreHit, this, ref(inFace), pitEntry, _1, _2),
-                bind(&Forwarder::onContentStoreMiss, this, ref(inFace), pitEntry, _1));
+                bind(&Forwarder::onContentStoreHit, this, std::ref(inFace), pitEntry, _1, _2),
+                bind(&Forwarder::onContentStoreMiss, this, std::ref(inFace), pitEntry, _1));
     }
     else {
       shared_ptr<Data> match = m_csFromNdnSim->Lookup(interest.shared_from_this());
@@ -119,58 +157,18 @@ Forwarder::onIncomingInterest(Face& inFace, const Interest& interest)
   }
 }
 
+//* the angle calculation and projection calculation needs revision 
+//that is in the class below *//
 void
-Forwarder::onContentStoreMiss(const Face& inFace,
-                              shared_ptr<pit::Entry> pitEntry,
-                              const Interest& interest)
-{
-  NFD_LOG_DEBUG("onContentStoreMiss interest=" << interest.getName());
-
-  shared_ptr<Face> face = const_pointer_cast<Face>(inFace.shared_from_this());
-  // insert InRecord
-  pitEntry->insertOrUpdateInRecord(face, interest);
-
-  // set PIT unsatisfy timer
-  this->setUnsatisfyTimer(pitEntry);
-
-  // FIB lookup
-  shared_ptr<fib::Entry> fibEntry = m_fib.findLongestPrefixMatch(*pitEntry);
-
-  // dispatch to strategy
-  this->dispatchToStrategy(pitEntry, bind(&Strategy::afterReceiveInterest, _1,
-                                          cref(inFace), cref(interest), fibEntry, pitEntry));
-}
-
-void
-Forwarder::onContentStoreHit(const Face& inFace,
-                             shared_ptr<pit::Entry> pitEntry,
-                             const Interest& interest,
-                             const Data& data)
-{
-  NFD_LOG_DEBUG("onContentStoreHit interest=" << interest.getName());
-
-  beforeSatisfyInterest(*pitEntry, *m_csFace, data);
-  this->dispatchToStrategy(pitEntry, bind(&Strategy::beforeSatisfyInterest, _1,
-                                          pitEntry, cref(*m_csFace), cref(data)));
-
-  const_pointer_cast<Data>(data.shared_from_this())->setIncomingFaceId(FACEID_CONTENT_STORE);
-  // XXX should we lookup PIT for other Interests that also match csMatch?
-
-  // set PIT straggler timer
-  this->setStragglerTimer(pitEntry, true, data.getFreshnessPeriod());
-
-  // goto outgoing Data pipeline
-  this->onOutgoingData(data, *const_pointer_cast<Face>(inFace.shared_from_this()));
-}
 Forwarder::CalculateAngleandProjection(lp::GeoTag previousHop,lp::GeoTag previousTOpreviousHop, Ptr<ns3::Packet> Packet);
 
 {
+// the last hop position from the interest received
+Vector3D lastHopPosition = Vector3D(previousHop.getPosX(), previousHop.getPosY(), 0);
+//* previous to lasthop position from pit inrecord interest
+Vector3D previousTOpreviousHop = pit::&inRecord.getinterest().MobilityModel::GetPosition() ; 
 
-Vector3D lastHopPosition = Vector3D(previousHop.getPosX(), previousHop.getPosY(), 0)
-Vector3D previousTOpreviousHop = ; //* have to add pointer to pit table entry hence interest.cpp needs changes to get the tag from the matching interest in pitentry 
-
-//to previous hop or the producer of interest
-
+// current position of the node
 Vector3D currentPosition = mobility->GetPosition(); 
 
 // Distance calculation using Getlength() function from mobility.h 
@@ -187,9 +185,10 @@ Angle_Deg = Angle_rad * 180 / 3.141592 ;
 
 cosine_Angle_at_currentposition = ((Distance(currentPosition,lastHopPosition)^2 + Distance(lastHopPosition,previousTOpreviousHop)^2 - Distance(currentPosition,previousTOpreviousHop) ))/(2*Distance(currentPosition,previousTOpreviousHop)*Distance(lastHopPosition,previousTOpreviousHop));
 projection = Distance(currentPosition,lastHopPosition) * cosine_Angle_at_currentposition;
-// if angles between previous to previous hop and current node > 90'
 
-if (Angle_Deg > 90)
+// if angles between previous to previous hop and current node >= 90'
+
+if (Angle_Deg >= 90)
 {
 bool direction = true;
 }
@@ -201,16 +200,12 @@ bool direction = true;
 }
 else {bool direction = false;}
 }
-
 void
-Forwarder::onInterestLoop(Face& inFace, const Interest& interest,
-                          shared_ptr<pit::Entry> pitEntry)
+Forwarder::onInterestLoop(Face& inFace, const Interest& interest, bool direction)
 {
   NFD_LOG_DEBUG("onInterestLoop face=" << inFace.getId() <<
                 " interest=" << interest.getName());
                 {
-
-
 
 NFD_LOG_DEBUG("onInterestLoop in=" << ingress << " interest=" << interest.getName()
 
@@ -222,124 +217,124 @@ NFD_LOG_DEBUG("onInterestLoop in=" << ingress << " interest=" << interest.getNam
 
 << " is sending for afterinterloop");
 
-this-> REBROADCASTING::afterreceiveinterest(interest);
+this-> dispatchToStrategy();
 
 }
+    return;
+  }
+  NFD_LOG_DEBUG("onInterestLoop face=" << inFace.getId() <<
+                " interest=" << interest.getName() <<
+                " send-Nack-duplicate");
 
-
-  // (drop)
+  // send Nack with reason=DUPLICATE
+  // note: Don't enter outgoing Nack pipeline because it needs an in-record.
+  lp::Nack nack(interest);
+  nack.setReason(lp::NackReason::DUPLICATE);
+  inFace.sendNack(nack);
 }
-
-/** \brief compare two InRecords for picking outgoing Interest
- *  \return true if b is preferred over a
- *
- *  This function should be passed to std::max_element over InRecordCollection.
- *  The outgoing Interest picked is the last incoming Interest
- *  that does not come from outFace.
- *  If all InRecords come from outFace, it's fine to pick that. This happens when
- *  there's only one InRecord that comes from outFace. The legit use is for
- *  vehicular network; otherwise, strategy shouldn't send to the sole inFace.
- */
 static inline bool
-compare_pickInterest(const pit::InRecord& a, const pit::InRecord& b, const Face* outFace)
+compare_InRecord_expiry(const pit::InRecord& a, const pit::InRecord& b)
 {
-  bool isOutFaceA = a.getFace().get() == outFace;
-  bool isOutFaceB = b.getFace().get() == outFace;
-
-  if (!isOutFaceA && isOutFaceB) {
-    return false;
-  }
-  if (isOutFaceA && !isOutFaceB) {
-    return true;
-  }
-
-  return a.getLastRenewed() > b.getLastRenewed();
+  return a.getExpiry() < b.getExpiry();
 }
 
 void
-Forwarder::onOutgoingInterest(shared_ptr<pit::Entry> pitEntry, Face& outFace,
-                              bool wantNewNonce)
+Forwarder::onContentStoreMiss(const Face& inFace, const shared_ptr<pit::Entry>& pitEntry,
+                              const Interest& interest)
 {
-  if (outFace.getId() == INVALID_FACEID) {
-    NFD_LOG_WARN("onOutgoingInterest face=invalid interest=" << pitEntry->getName());
+  NFD_LOG_DEBUG("onContentStoreMiss interest=" << interest.getName());
+  ++m_counters.nCsMisses;
+
+  // insert in-record
+  pitEntry->insertOrUpdateInRecord(const_cast<Face&>(inFace), interest);
+
+  // set PIT expiry timer to the time that the last PIT in-record expires
+  auto lastExpiring = std::max_element(pitEntry->in_begin(), pitEntry->in_end(), &compare_InRecord_expiry);
+  auto lastExpiryFromNow = lastExpiring->getExpiry() - time::steady_clock::now();
+  this->setExpiryTimer(pitEntry, time::duration_cast<time::milliseconds>(lastExpiryFromNow));
+
+  // has NextHopFaceId?
+  shared_ptr<lp::NextHopFaceIdTag> nextHopTag = interest.getTag<lp::NextHopFaceIdTag>();
+  if (nextHopTag != nullptr) {
+    // chosen NextHop face exists?
+    Face* nextHopFace = m_faceTable.get(*nextHopTag);
+    if (nextHopFace != nullptr) {
+      NFD_LOG_DEBUG("onContentStoreMiss interest=" << interest.getName() << " nexthop-faceid=" << nextHopFace->getId());
+      // go to outgoing Interest pipeline
+      // scope control is unnecessary, because privileged app explicitly wants to forward
+      this->onOutgoingInterest(pitEntry, *nextHopFace, interest);
+    }
     return;
   }
+
+  // dispatch to strategy: after incoming Interest
+  this->dispatchToStrategy(*pitEntry,
+    [&] (fw::Strategy& strategy) { strategy.afterReceiveInterest(inFace, interest, pitEntry); });
+}
+
+void
+Forwarder::onContentStoreHit(const Face& inFace, const shared_ptr<pit::Entry>& pitEntry,
+                             const Interest& interest, const Data& data)
+{
+  NFD_LOG_DEBUG("onContentStoreHit interest=" << interest.getName());
+  ++m_counters.nCsHits;
+
+  data.setTag(make_shared<lp::IncomingFaceIdTag>(face::FACEID_CONTENT_STORE));
+  // XXX should we lookup PIT for other Interests that also match csMatch?
+
+  pitEntry->isSatisfied = true;
+  pitEntry->dataFreshnessPeriod = data.getFreshnessPeriod();
+
+  // set PIT expiry timer to now
+  this->setExpiryTimer(pitEntry, 0_ms);
+
+  beforeSatisfyInterest(*pitEntry, *m_csFace, data);
+  this->dispatchToStrategy(*pitEntry,
+    [&] (fw::Strategy& strategy) { strategy.beforeSatisfyInterest(pitEntry, *m_csFace, data); });
+
+  // dispatch to strategy: after Content Store hit
+  this->dispatchToStrategy(*pitEntry,
+    [&] (fw::Strategy& strategy) { strategy.afterContentStoreHit(pitEntry, inFace, data); });
+}
+
+void
+Forwarder::onOutgoingInterest(const shared_ptr<pit::Entry>& pitEntry, Face& outFace, const Interest& interest)
+{
   NFD_LOG_DEBUG("onOutgoingInterest face=" << outFace.getId() <<
                 " interest=" << pitEntry->getName());
 
-  // scope control
-  if (pitEntry->violatesScope(outFace)) {
-    NFD_LOG_DEBUG("onOutgoingInterest face=" << outFace.getId() <<
-                  " interest=" << pitEntry->getName() << " violates scope");
-    return;
-  }
-
-  // pick Interest
-  const pit::InRecordCollection& inRecords = pitEntry->getInRecords();
-  pit::InRecordCollection::const_iterator pickedInRecord = std::max_element(
-    inRecords.begin(), inRecords.end(), bind(&compare_pickInterest, _1, _2, &outFace));
-  BOOST_ASSERT(pickedInRecord != inRecords.end());
-  shared_ptr<Interest> interest = const_pointer_cast<Interest>(
-    pickedInRecord->getInterest().shared_from_this());
-
-  if (wantNewNonce) {
-    interest = make_shared<Interest>(*interest);
-    static boost::random::uniform_int_distribution<uint32_t> dist;
-    interest->setNonce(dist(getGlobalRng()));
-  }
-
-  // insert OutRecord
-  pitEntry->insertOrUpdateOutRecord(outFace.shared_from_this(), *interest);
+  // insert out-record
+  pitEntry->insertOrUpdateOutRecord(outFace, interest);
 
   // send Interest
-  outFace.sendInterest(*interest);
-  ++m_counters.getNOutInterests();
+  outFace.sendInterest(interest);
+  ++m_counters.nOutInterests;
 }
 
 void
-Forwarder::onInterestReject(shared_ptr<pit::Entry> pitEntry)
-{
-  if (pitEntry->hasUnexpiredOutRecords()) {
-    NFD_LOG_ERROR("onInterestReject interest=" << pitEntry->getName() <<
-                  " cannot reject forwarded Interest");
-    return;
-  }
-  NFD_LOG_DEBUG("onInterestReject interest=" << pitEntry->getName());
-
-  // cancel unsatisfy & straggler timer
-  this->cancelUnsatisfyAndStragglerTimer(pitEntry);
-
-  // set PIT straggler timer
-  this->setStragglerTimer(pitEntry, false);
-}
-
-void
-Forwarder::onInterestUnsatisfied(shared_ptr<pit::Entry> pitEntry)
-{
-  NFD_LOG_DEBUG("onInterestUnsatisfied interest=" << pitEntry->getName());
-
-  // invoke PIT unsatisfied callback
-  beforeExpirePendingInterest(*pitEntry);
-  this->dispatchToStrategy(pitEntry, bind(&Strategy::beforeExpirePendingInterest, _1,
-                                          pitEntry));
-
-  // goto Interest Finalize pipeline
-  this->onInterestFinalize(pitEntry, false);
-}
-
-void
-Forwarder::onInterestFinalize(shared_ptr<pit::Entry> pitEntry, bool isSatisfied,
-                              const time::milliseconds& dataFreshnessPeriod)
+Forwarder::onInterestFinalize(const shared_ptr<pit::Entry>& pitEntry)
 {
   NFD_LOG_DEBUG("onInterestFinalize interest=" << pitEntry->getName() <<
-                (isSatisfied ? " satisfied" : " unsatisfied"));
+                (pitEntry->isSatisfied ? " satisfied" : " unsatisfied"));
+
+  if (!pitEntry->isSatisfied) {
+    beforeExpirePendingInterest(*pitEntry);
+  }
 
   // Dead Nonce List insert if necessary
-  this->insertDeadNonceList(*pitEntry, isSatisfied, dataFreshnessPeriod, 0);
+  this->insertDeadNonceList(*pitEntry, 0);
+
+  // Increment satisfied/unsatisfied Interests counter
+  if (pitEntry->isSatisfied) {
+    ++m_counters.nSatisfiedInterests;
+  }
+  else {
+    ++m_counters.nUnsatisfiedInterests;
+  }
 
   // PIT delete
-  this->cancelUnsatisfyAndStragglerTimer(pitEntry);
-  m_pit.erase(pitEntry);
+  scheduler::cancel(pitEntry->expiryTimer);
+  m_pit.erase(pitEntry.get());
 }
 
 void
@@ -347,12 +342,12 @@ Forwarder::onIncomingData(Face& inFace, const Data& data)
 {
   // receive Data
   NFD_LOG_DEBUG("onIncomingData face=" << inFace.getId() << " data=" << data.getName());
-  const_cast<Data&>(data).setIncomingFaceId(inFace.getId());
-  ++m_counters.getNInDatas();
+  data.setTag(make_shared<lp::IncomingFaceIdTag>(inFace.getId()));
+  ++m_counters.nInData;
 
   // /localhost scope control
-  bool isViolatingLocalhost = !inFace.isLocal() &&
-                              LOCALHOST_NAME.isPrefixOf(data.getName());
+  bool isViolatingLocalhost = inFace.getScope() == ndn::nfd::FACE_SCOPE_NON_LOCAL &&
+                              scope_prefix::LOCALHOST.isPrefixOf(data.getName());
   if (isViolatingLocalhost) {
     NFD_LOG_DEBUG("onIncomingData face=" << inFace.getId() <<
                   " data=" << data.getName() << " violates /localhost");
@@ -362,69 +357,90 @@ Forwarder::onIncomingData(Face& inFace, const Data& data)
 
   // PIT match
   pit::DataMatchResult pitMatches = m_pit.findAllDataMatches(data);
-  if (pitMatches.begin() == pitMatches.end()) {
+  if (pitMatches.size() == 0) {
     // goto Data unsolicited pipeline
     this->onDataUnsolicited(inFace, data);
     return;
   }
 
-  // Remove Ptr<Packet> from the Data before inserting into cache, serving two purposes
-  // - reduce amount of memory used by cached entries
-  // - remove all tags that (e.g., hop count tag) that could have been associated with Ptr<Packet>
-  //
-  // Copying of Data is relatively cheap operation, as it copies (mostly) a collection of Blocks
-  // pointing to the same underlying memory buffer.
-  shared_ptr<Data> dataCopyWithoutPacket = make_shared<Data>(data);
-  dataCopyWithoutPacket->removeTag<ns3::ndn::Ns3PacketTag>();
+  shared_ptr<Data> dataCopyWithoutTag = make_shared<Data>(data);
+  dataCopyWithoutTag->removeTag<lp::HopCountTag>();
 
   // CS insert
   if (m_csFromNdnSim == nullptr)
-    m_cs.insert(*dataCopyWithoutPacket);
+    m_cs.insert(*dataCopyWithoutTag);
   else
-    m_csFromNdnSim->Add(dataCopyWithoutPacket);
+    m_csFromNdnSim->Add(dataCopyWithoutTag);
 
-  std::set<shared_ptr<Face> > pendingDownstreams;
-  // foreach PitEntry
-  for (const shared_ptr<pit::Entry>& pitEntry : pitMatches) {
+  // when only one PIT entry is matched, trigger strategy: after receive Data
+  if (pitMatches.size() == 1) {
+    auto& pitEntry = pitMatches.front();
+
     NFD_LOG_DEBUG("onIncomingData matching=" << pitEntry->getName());
 
-    // cancel unsatisfy & straggler timer
-    this->cancelUnsatisfyAndStragglerTimer(pitEntry);
+    // set PIT expiry timer to now
+    this->setExpiryTimer(pitEntry, 0_ms);
 
-    // remember pending downstreams
-    const pit::InRecordCollection& inRecords = pitEntry->getInRecords();
-    for (pit::InRecordCollection::const_iterator it = inRecords.begin();
-                                                 it != inRecords.end(); ++it) {
-      if (it->getExpiry() > time::steady_clock::now()) {
-        pendingDownstreams.insert(it->getFace());
-      }
-    }
-
-    // invoke PIT satisfy callback
     beforeSatisfyInterest(*pitEntry, inFace, data);
-    this->dispatchToStrategy(pitEntry, bind(&Strategy::beforeSatisfyInterest, _1,
-                                            pitEntry, cref(inFace), cref(data)));
-
-    // Dead Nonce List insert if necessary (for OutRecord of inFace)
-    this->insertDeadNonceList(*pitEntry, true, data.getFreshnessPeriod(), &inFace);
+    // trigger strategy: after receive Data
+    this->dispatchToStrategy(*pitEntry,
+      [&] (fw::Strategy& strategy) { strategy.afterReceiveData(pitEntry, inFace, data); });
 
     // mark PIT satisfied
-    pitEntry->deleteInRecords();
+    pitEntry->isSatisfied = true;
+    pitEntry->dataFreshnessPeriod = data.getFreshnessPeriod();
+
+    // Dead Nonce List insert if necessary (for out-record of inFace)
+    this->insertDeadNonceList(*pitEntry, &inFace);
+
+    // delete PIT entry's out-record
     pitEntry->deleteOutRecord(inFace);
-
-    // set PIT straggler timer
-    this->setStragglerTimer(pitEntry, true, data.getFreshnessPeriod());
   }
+  // when more than one PIT entry is matched, trigger strategy: before satisfy Interest,
+  // and send Data to all matched out faces
+  else {
+    std::set<Face*> pendingDownstreams;
+    auto now = time::steady_clock::now();
 
-  // foreach pending downstream
-  for (std::set<shared_ptr<Face> >::iterator it = pendingDownstreams.begin();
-      it != pendingDownstreams.end(); ++it) {
-    shared_ptr<Face> pendingDownstream = *it;
-    if (pendingDownstream.get() == &inFace) {
-      continue;
+    for (const shared_ptr<pit::Entry>& pitEntry : pitMatches) {
+      NFD_LOG_DEBUG("onIncomingData matching=" << pitEntry->getName());
+
+      // remember pending downstreams
+      for (const pit::InRecord& inRecord : pitEntry->getInRecords()) {
+        if (inRecord.getExpiry() > now) {
+          pendingDownstreams.insert(&inRecord.getFace());
+        }
+      }
+
+      // set PIT expiry timer to now
+      this->setExpiryTimer(pitEntry, 0_ms);
+
+      // invoke PIT satisfy callback
+      beforeSatisfyInterest(*pitEntry, inFace, data);
+      this->dispatchToStrategy(*pitEntry,
+        [&] (fw::Strategy& strategy) { strategy.beforeSatisfyInterest(pitEntry, inFace, data); });
+
+      // mark PIT satisfied
+      pitEntry->isSatisfied = true;
+      pitEntry->dataFreshnessPeriod = data.getFreshnessPeriod();
+
+      // Dead Nonce List insert if necessary (for out-record of inFace)
+      this->insertDeadNonceList(*pitEntry, &inFace);
+
+      // clear PIT entry's in and out records
+      pitEntry->clearInRecords();
+      pitEntry->deleteOutRecord(inFace);
     }
-    // goto outgoing Data pipeline
-    this->onOutgoingData(data, *pendingDownstream);
+
+    // foreach pending downstream
+    for (Face* pendingDownstream : pendingDownstreams) {
+      if (pendingDownstream->getId() == inFace.getId() &&
+          pendingDownstream->getLinkType() != ndn::nfd::LINK_TYPE_AD_HOC) {
+        continue;
+      }
+      // goto outgoing Data pipeline
+      this->onOutgoingData(data, *pendingDownstream);
+    }
   }
 }
 
@@ -432,8 +448,8 @@ void
 Forwarder::onDataUnsolicited(Face& inFace, const Data& data)
 {
   // accept to cache?
-  bool acceptToCache = inFace.isLocal();
-  if (acceptToCache) {
+  fw::UnsolicitedDataDecision decision = m_unsolicitedDataPolicy->decide(inFace, data);
+  if (decision == fw::UnsolicitedDataDecision::CACHE) {
     // CS insert
     if (m_csFromNdnSim == nullptr)
       m_cs.insert(data, true);
@@ -443,21 +459,21 @@ Forwarder::onDataUnsolicited(Face& inFace, const Data& data)
 
   NFD_LOG_DEBUG("onDataUnsolicited face=" << inFace.getId() <<
                 " data=" << data.getName() <<
-                (acceptToCache ? " cached" : " not cached"));
+                " decision=" << decision);
 }
 
 void
 Forwarder::onOutgoingData(const Data& data, Face& outFace)
 {
-  if (outFace.getId() == INVALID_FACEID) {
+  if (outFace.getId() == face::INVALID_FACEID) {
     NFD_LOG_WARN("onOutgoingData face=invalid data=" << data.getName());
     return;
   }
   NFD_LOG_DEBUG("onOutgoingData face=" << outFace.getId() << " data=" << data.getName());
 
   // /localhost scope control
-  bool isViolatingLocalhost = !outFace.isLocal() &&
-                              LOCALHOST_NAME.isPrefixOf(data.getName());
+  bool isViolatingLocalhost = outFace.getScope() == ndn::nfd::FACE_SCOPE_NON_LOCAL &&
+                              scope_prefix::LOCALHOST.isPrefixOf(data.getName());
   if (isViolatingLocalhost) {
     NFD_LOG_DEBUG("onOutgoingData face=" << outFace.getId() <<
                   " data=" << data.getName() << " violates /localhost");
@@ -469,74 +485,142 @@ Forwarder::onOutgoingData(const Data& data, Face& outFace)
 
   // send Data
   outFace.sendData(data);
-  ++m_counters.getNOutDatas();
-}
-
-static inline bool
-compare_InRecord_expiry(const pit::InRecord& a, const pit::InRecord& b)
-{
-  return a.getExpiry() < b.getExpiry();
+  ++m_counters.nOutData;
 }
 
 void
-Forwarder::setUnsatisfyTimer(shared_ptr<pit::Entry> pitEntry)
+Forwarder::onIncomingNack(Face& inFace, const lp::Nack& nack)
 {
-  const pit::InRecordCollection& inRecords = pitEntry->getInRecords();
-  pit::InRecordCollection::const_iterator lastExpiring =
-    std::max_element(inRecords.begin(), inRecords.end(),
-    &compare_InRecord_expiry);
+  // receive Nack
+  nack.setTag(make_shared<lp::IncomingFaceIdTag>(inFace.getId()));
+  ++m_counters.nInNacks;
 
-  time::steady_clock::TimePoint lastExpiry = lastExpiring->getExpiry();
-  time::nanoseconds lastExpiryFromNow = lastExpiry  - time::steady_clock::now();
-  if (lastExpiryFromNow <= time::seconds(0)) {
-    // TODO all InRecords are already expired; will this happen?
+  // if multi-access or ad hoc face, drop
+  if (inFace.getLinkType() != ndn::nfd::LINK_TYPE_POINT_TO_POINT) {
+    NFD_LOG_DEBUG("onIncomingNack face=" << inFace.getId() <<
+                  " nack=" << nack.getInterest().getName() <<
+                  "~" << nack.getReason() << " face-is-multi-access");
+    return;
   }
 
-  scheduler::cancel(pitEntry->m_unsatisfyTimer);
-  pitEntry->m_unsatisfyTimer = scheduler::schedule(lastExpiryFromNow,
-    bind(&Forwarder::onInterestUnsatisfied, this, pitEntry));
+  // PIT match
+  shared_ptr<pit::Entry> pitEntry = m_pit.find(nack.getInterest());
+  // if no PIT entry found, drop
+  if (pitEntry == nullptr) {
+    NFD_LOG_DEBUG("onIncomingNack face=" << inFace.getId() <<
+                  " nack=" << nack.getInterest().getName() <<
+                  "~" << nack.getReason() << " no-PIT-entry");
+    return;
+  }
+
+  // has out-record?
+  pit::OutRecordCollection::iterator outRecord = pitEntry->getOutRecord(inFace);
+  // if no out-record found, drop
+  if (outRecord == pitEntry->out_end()) {
+    NFD_LOG_DEBUG("onIncomingNack face=" << inFace.getId() <<
+                  " nack=" << nack.getInterest().getName() <<
+                  "~" << nack.getReason() << " no-out-record");
+    return;
+  }
+
+  // if out-record has different Nonce, drop
+  if (nack.getInterest().getNonce() != outRecord->getLastNonce()) {
+    NFD_LOG_DEBUG("onIncomingNack face=" << inFace.getId() <<
+                  " nack=" << nack.getInterest().getName() <<
+                  "~" << nack.getReason() << " wrong-Nonce " <<
+                  nack.getInterest().getNonce() << "!=" << outRecord->getLastNonce());
+    return;
+  }
+
+  NFD_LOG_DEBUG("onIncomingNack face=" << inFace.getId() <<
+                " nack=" << nack.getInterest().getName() <<
+                "~" << nack.getReason() << " OK");
+
+  // record Nack on out-record
+  outRecord->setIncomingNack(nack);
+
+  // set PIT expiry timer to now when all out-record receive Nack
+  if (!fw::hasPendingOutRecords(*pitEntry)) {
+    this->setExpiryTimer(pitEntry, 0_ms);
+  }
+
+  // trigger strategy: after receive NACK
+  this->dispatchToStrategy(*pitEntry,
+    [&] (fw::Strategy& strategy) { strategy.afterReceiveNack(inFace, nack, pitEntry); });
 }
 
 void
-Forwarder::setStragglerTimer(shared_ptr<pit::Entry> pitEntry, bool isSatisfied,
-                             const time::milliseconds& dataFreshnessPeriod)
+Forwarder::onOutgoingNack(const shared_ptr<pit::Entry>& pitEntry, const Face& outFace,
+                          const lp::NackHeader& nack)
 {
-  time::nanoseconds stragglerTime = time::milliseconds(100);
+  if (outFace.getId() == face::INVALID_FACEID) {
+    NFD_LOG_WARN("onOutgoingNack face=invalid" <<
+                  " nack=" << pitEntry->getInterest().getName() <<
+                  "~" << nack.getReason() << " no-in-record");
+    return;
+  }
 
-  scheduler::cancel(pitEntry->m_stragglerTimer);
-  pitEntry->m_stragglerTimer = scheduler::schedule(stragglerTime,
-    bind(&Forwarder::onInterestFinalize, this, pitEntry, isSatisfied, dataFreshnessPeriod));
+  // has in-record?
+  pit::InRecordCollection::iterator inRecord = pitEntry->getInRecord(outFace);
+
+  // if no in-record found, drop
+  if (inRecord == pitEntry->in_end()) {
+    NFD_LOG_DEBUG("onOutgoingNack face=" << outFace.getId() <<
+                  " nack=" << pitEntry->getInterest().getName() <<
+                  "~" << nack.getReason() << " no-in-record");
+    return;
+  }
+
+  // if multi-access or ad hoc face, drop
+  if (outFace.getLinkType() != ndn::nfd::LINK_TYPE_POINT_TO_POINT) {
+    NFD_LOG_DEBUG("onOutgoingNack face=" << outFace.getId() <<
+                  " nack=" << pitEntry->getInterest().getName() <<
+                  "~" << nack.getReason() << " face-is-multi-access");
+    return;
+  }
+
+  NFD_LOG_DEBUG("onOutgoingNack face=" << outFace.getId() <<
+                " nack=" << pitEntry->getInterest().getName() <<
+                "~" << nack.getReason() << " OK");
+
+  // create Nack packet with the Interest from in-record
+  lp::Nack nackPkt(inRecord->getInterest());
+  nackPkt.setHeader(nack);
+
+  // erase in-record
+  pitEntry->deleteInRecord(outFace);
+
+  // send Nack on face
+  const_cast<Face&>(outFace).sendNack(nackPkt);
+  ++m_counters.nOutNacks;
 }
 
 void
-Forwarder::cancelUnsatisfyAndStragglerTimer(shared_ptr<pit::Entry> pitEntry)
+Forwarder::onDroppedInterest(Face& outFace, const Interest& interest)
 {
-  scheduler::cancel(pitEntry->m_unsatisfyTimer);
-  scheduler::cancel(pitEntry->m_stragglerTimer);
-}
-
-static inline void
-insertNonceToDnl(DeadNonceList& dnl, const pit::Entry& pitEntry,
-                 const pit::OutRecord& outRecord)
-{
-  dnl.add(pitEntry.getName(), outRecord.getLastNonce());
+  m_strategyChoice.findEffectiveStrategy(interest.getName()).onDroppedInterest(outFace, interest);
 }
 
 void
-Forwarder::insertDeadNonceList(pit::Entry& pitEntry, bool isSatisfied,
-                               const time::milliseconds& dataFreshnessPeriod,
-                               Face* upstream)
+Forwarder::setExpiryTimer(const shared_ptr<pit::Entry>& pitEntry, time::milliseconds duration)
+{
+  BOOST_ASSERT(pitEntry);
+  BOOST_ASSERT(duration >= 0_ms);
+
+  scheduler::cancel(pitEntry->expiryTimer);
+
+  pitEntry->expiryTimer = scheduler::schedule(duration, [=] { onInterestFinalize(pitEntry); });
+}
+
+void
+Forwarder::insertDeadNonceList(pit::Entry& pitEntry, Face* upstream)
 {
   // need Dead Nonce List insert?
-  bool needDnl = false;
-  if (isSatisfied) {
-    bool hasFreshnessPeriod = dataFreshnessPeriod >= time::milliseconds::zero();
-    // Data never becomes stale if it doesn't have FreshnessPeriod field
+  bool needDnl = true;
+  if (pitEntry.isSatisfied) {
+    BOOST_ASSERT(pitEntry.dataFreshnessPeriod >= 0_ms);
     needDnl = static_cast<bool>(pitEntry.getInterest().getMustBeFresh()) &&
-              (hasFreshnessPeriod && dataFreshnessPeriod < m_deadNonceList.getLifetime());
-  }
-  else {
-    needDnl = true;
+              pitEntry.dataFreshnessPeriod < m_deadNonceList.getLifetime();
   }
 
   if (!needDnl) {
@@ -544,15 +628,16 @@ Forwarder::insertDeadNonceList(pit::Entry& pitEntry, bool isSatisfied,
   }
 
   // Dead Nonce List insert
-  if (upstream == 0) {
+  if (upstream == nullptr) {
     // insert all outgoing Nonces
-    const pit::OutRecordCollection& outRecords = pitEntry.getOutRecords();
-    std::for_each(outRecords.begin(), outRecords.end(),
-                  bind(&insertNonceToDnl, ref(m_deadNonceList), cref(pitEntry), _1));
+    const auto& outRecords = pitEntry.getOutRecords();
+    std::for_each(outRecords.begin(), outRecords.end(), [&] (const auto& outRecord) {
+      m_deadNonceList.add(pitEntry.getName(), outRecord.getLastNonce());
+    });
   }
   else {
     // insert outgoing Nonce of a specific face
-    pit::OutRecordCollection::const_iterator outRecord = pitEntry.getOutRecord(*upstream);
+    auto outRecord = pitEntry.getOutRecord(*upstream);
     if (outRecord != pitEntry.getOutRecords().end()) {
       m_deadNonceList.add(pitEntry.getName(), outRecord->getLastNonce());
     }
