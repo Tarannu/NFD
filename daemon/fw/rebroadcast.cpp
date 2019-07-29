@@ -58,7 +58,7 @@ void
 REBROADCASTING::cancelrebroadcast()
 
 {
-end m_schedule;
+m_schedule.end();
 }
 
 void
@@ -79,8 +79,7 @@ REBROADCASTING::afterReceiveInterest(const FaceEndpoint& ingress, const Interest
           if (!pitEntry->hasUnexpiredOutRecords()) 
         {
         this-> cancelrebroadcast();
-        //this->rejectPendingInterest(pitEntry);
-        //this -> onInterestLoop(ingress, interest);
+        
         }
 
     }
