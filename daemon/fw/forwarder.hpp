@@ -262,6 +262,7 @@ PUBLIC_WITH_TESTS_ELSE_PRIVATE: // pipelines
   VIRTUAL_WITH_TESTS void
   onDroppedInterest(Face& outFace, const Interest& interest);
 
+
 PROTECTED_WITH_TESTS_ELSE_PRIVATE:
   /** \brief set a new expiry timer (now + \p duration) on a PIT entry
    */
@@ -274,8 +275,13 @@ PROTECTED_WITH_TESTS_ELSE_PRIVATE:
    */
   VIRTUAL_WITH_TESTS void
   insertDeadNonceList(pit::Entry& pitEntry, Face* upstream);
-
-  /** \brief call trigger (method) on the effective strategy of pitEntry
+  
+  /* Calculation method for deciding if interest loop can send to strategy or not  */
+ 
+  VIRTUAL_WITH_TESTS void
+  CalculateAngleandProjection(lp::GeoTag previousHop,lp::GeoTag previousTOpreviousHop, Ptr<ns3::Packet> Packet);
+  
+   /** \brief call trigger (method) on the effective strategy of pitEntry
    */
 #ifdef WITH_TESTS
   virtual void
